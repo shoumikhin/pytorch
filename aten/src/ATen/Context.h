@@ -399,6 +399,32 @@ class TORCH_API Context {
       Float32Precision p);
   bool allowTF32CuDNN(std::optional<Float32Op> op = std::nullopt) const;
   void setAllowTF32CuDNN(bool /*b*/);
+  // Every fp32 precision setting exactly as stored (an op still at its
+  // internal default keeps it), so code that must undo changes to them can
+  // restore them as they were. encode() and decode() carry it to another
+  // process; decode() rejects values the setters would never store.
+  class TORCH_API Float32PrecisionState {
+   public:
+    std::vector<int64_t> encode() const;
+    static Float32PrecisionState decode(const std::vector<int64_t>& values);
+    bool operator==(const Float32PrecisionState& other) const;
+
+   private:
+    friend class Context;
+    Float32PrecisionState() = default;
+    using Key = std::pair<Float32Backend, Float32Op>;
+    std::unordered_map<Key, Float32Precision, c10::hash<Key>> fp32_precision;
+    Float32MatmulPrecision float32_matmul_precision{};
+    bool allow_tf32_cudnn{};
+    bool allow_tf32_onednn{};
+  };
+  Float32PrecisionState float32PrecisionState() const;
+  void setFloat32PrecisionState(const Float32PrecisionState& state);
+  // Changes whenever an entry of the per-(backend, op) precision map changes,
+  // so a caller that recorded it can skip comparing those entries.
+  uint64_t float32PrecisionVersion() const {
+    return fp32_precision_version.load(std::memory_order_acquire);
+  }
   bool allowTF32OneDNN() const;
   void setAllowTF32OneDNN(bool /*b*/);
   bool allowTF32CuBLAS() const;
@@ -566,6 +592,7 @@ class TORCH_API Context {
   bool warn_on_accumulate_grad_stream_mismatch_ = true;
   bool override_stale_capture_stream_ = false;
   std::atomic<at::QEngine> quantized_engine = at::QEngine::NoQEngine;
+  std::atomic<uint64_t> fp32_precision_version = 0;
   std::optional<bool> enable_sparse_tensor_invariant_checks = std::nullopt;
   bool allow_fp16_reduction_cpu = false;
   bool allow_native_aot = true;

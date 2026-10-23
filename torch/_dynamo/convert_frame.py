@@ -178,6 +178,7 @@ from .utils import (
     setup_compile_debug,
     to_int_us,
     troubleshooting_url,
+    warn_once,
     write_record_to_file,
 )
 from .variables.torch_function import torch_function_mode_stack_state_mgr
@@ -359,9 +360,7 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
             if torch.cuda.is_available():
                 with torch._C.DisableTorchFunction():
                     cuda_rng_state = torch.cuda.get_rng_state()
-            cuda_matmul_fp32_prec = torch._C._get_fp32_precision_getter(
-                "cuda", "matmul"
-            )
+            fp32_precision_state = torch._C._get_float32_precision_state()
             prior_fwd_from_src = torch.fx.graph_module._forward_from_src
             torch.fx.graph_module._forward_from_src = fx_forward_from_src_skip_result
             cleanup = setup_compile_debug()
@@ -390,9 +389,17 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
                 if cuda_rng_state is not None:
                     with torch._C.DisableTorchFunction():
                         torch.cuda.set_rng_state(cuda_rng_state)
-                torch._C._set_fp32_precision_setter(
-                    "cuda", "matmul", cuda_matmul_fp32_prec
-                )
+                # Dynamo runs some fp32 precision setters while tracing, such as
+                # torch.set_float32_matmul_precision and
+                # torch.backends.cudnn.set_flags. Restore the stored values, not the
+                # resolved ones, so a precision that inherits keeps inheriting.
+                if torch._C._get_float32_precision_state() != fp32_precision_state:
+                    torch._C._set_float32_precision_state(fp32_precision_state)
+                    warn_once(
+                        "torch.compile restored fp32 precision settings that changed "
+                        "while tracing. A setter that the backend drops from the graph "
+                        "does not take effect; call it outside the compiled function."
+                    )
                 torch.fx.graph_module._forward_from_src = prior_fwd_from_src
                 if not guards.check():
                     raise AssertionError(

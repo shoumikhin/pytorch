@@ -274,6 +274,145 @@ void Context::setAllowTF32CuDNN(bool b) {
   allow_tf32_cudnn = b;
 }
 
+Context::Float32PrecisionState Context::float32PrecisionState() const {
+  Float32PrecisionState state;
+  state.fp32_precision = fp32_precision;
+  state.float32_matmul_precision = float32_matmul_precision;
+  state.allow_tf32_cudnn = allow_tf32_cudnn;
+  state.allow_tf32_onednn = allow_tf32_onednn;
+  return state;
+}
+
+std::vector<int64_t> Context::Float32PrecisionState::encode() const {
+  std::vector<int64_t> values{
+      static_cast<int64_t>(float32_matmul_precision),
+      allow_tf32_cudnn,
+      allow_tf32_onednn};
+  for (const auto& [key, precision] : fp32_precision) {
+    values.insert(
+        values.end(),
+        {static_cast<int64_t>(key.first),
+         static_cast<int64_t>(key.second),
+         static_cast<int64_t>(precision)});
+  }
+  return values;
+}
+
+namespace {
+// Exhaustive switches, so a new enumerator makes the compiler point here.
+bool isMatmulPrecision(int64_t value) {
+  switch (static_cast<Float32MatmulPrecision>(value)) {
+    case Float32MatmulPrecision::HIGHEST:
+    case Float32MatmulPrecision::HIGH:
+    case Float32MatmulPrecision::MEDIUM:
+      return true;
+  }
+  return false;
+}
+
+bool isBackend(int64_t value) {
+  switch (static_cast<Float32Backend>(value)) {
+    case Float32Backend::GENERIC:
+    case Float32Backend::CUDA:
+    case Float32Backend::MKLDNN:
+      return true;
+  }
+  return false;
+}
+
+bool isOp(int64_t value) {
+  switch (static_cast<Float32Op>(value)) {
+    case Float32Op::ALL:
+    case Float32Op::CONV:
+    case Float32Op::RNN:
+    case Float32Op::MATMUL:
+      return true;
+  }
+  return false;
+}
+
+bool isPrecision(int64_t value) {
+  switch (static_cast<Float32Precision>(value)) {
+    case Float32Precision::NONE:
+    case Float32Precision::IEEE:
+    case Float32Precision::TF32:
+    case Float32Precision::BF16:
+    case Float32Precision::DEFAULT:
+    case Float32Precision::BF16X9:
+      return true;
+  }
+  return false;
+}
+} // namespace
+
+Context::Float32PrecisionState Context::Float32PrecisionState::decode(
+    const std::vector<int64_t>& values) {
+  const auto is_bool = [](int64_t value) { return value == 0 || value == 1; };
+  TORCH_CHECK(
+      values.size() >= 3 && values.size() % 3 == 0 &&
+          isMatmulPrecision(values[0]) && is_bool(values[1]) &&
+          is_bool(values[2]),
+      "Invalid fp32 precision state");
+  Float32PrecisionState state;
+  state.float32_matmul_precision =
+      static_cast<Float32MatmulPrecision>(values[0]);
+  state.allow_tf32_cudnn = values[1] != 0;
+  state.allow_tf32_onednn = values[2] != 0;
+  for (size_t i = 3; i < values.size(); i += 3) {
+    TORCH_CHECK(
+        isBackend(values[i]) && isOp(values[i + 1]) &&
+            isPrecision(values[i + 2]),
+        "Invalid fp32 precision state");
+    const auto backend = static_cast<Float32Backend>(values[i]);
+    const auto op = static_cast<Float32Op>(values[i + 1]);
+    const auto precision = static_cast<Float32Precision>(values[i + 2]);
+    const bool cuda = backend == Float32Backend::CUDA;
+    // Values setFloat32Precision never stores, except that CUDA conv and RNN
+    // may still hold their internal DEFAULT.
+    TORCH_CHECK(
+        !(cuda && precision == Float32Precision::BF16) &&
+            (precision != Float32Precision::BF16X9 ||
+             (cuda && op == Float32Op::MATMUL)) &&
+            (precision != Float32Precision::DEFAULT ||
+             (cuda && (op == Float32Op::CONV || op == Float32Op::RNN))) &&
+            state.fp32_precision.emplace(Key{backend, op}, precision).second,
+        "Invalid fp32 precision state");
+  }
+  return state;
+}
+
+bool Context::Float32PrecisionState::operator==(
+    const Float32PrecisionState& other) const {
+  return fp32_precision == other.fp32_precision &&
+      float32_matmul_precision == other.float32_matmul_precision &&
+      allow_tf32_cudnn == other.allow_tf32_cudnn &&
+      allow_tf32_onednn == other.allow_tf32_onednn;
+}
+
+void Context::setFloat32PrecisionState(const Float32PrecisionState& state) {
+  TORCH_CHECK(
+      state.fp32_precision.size() == fp32_precision.size() &&
+          std::all_of(
+              state.fp32_precision.begin(),
+              state.fp32_precision.end(),
+              [this](const auto& entry) {
+                return fp32_precision.count(entry.first) == 1;
+              }),
+      "Invalid fp32 precision state");
+  // Other threads read the map without a lock, so assign the values in place
+  // rather than replacing the map and freeing what they may be reading.
+  for (const auto& [key, precision] : state.fp32_precision) {
+    auto& stored = fp32_precision.at(key);
+    if (stored != precision) {
+      stored = precision;
+      fp32_precision_version.fetch_add(1, std::memory_order_release);
+    }
+  }
+  float32_matmul_precision = state.float32_matmul_precision;
+  allow_tf32_cudnn = state.allow_tf32_cudnn;
+  allow_tf32_onednn = state.allow_tf32_onednn;
+}
+
 void Context::setSDPPriorityOrder(const std::vector<int64_t>& order) {
   // TODO*eqy): should it always be the number of backends - 1 (override backend excluded?)
   TORCH_CHECK(at::num_sdp_backends == sdp_priority_order.size(),
@@ -541,7 +680,10 @@ void Context::setFloat32Precision(Float32Backend backend, Float32Op op, Float32P
       p != Float32Precision::DEFAULT,
       "DEFAULT precision is internal and cannot be set explicitly");
 
-  it->second = p;
+  if (it->second != p) {
+    it->second = p;
+    fp32_precision_version.fetch_add(1, std::memory_order_release);
+  }
 }
 
 static void _warn_once_magma_deprecation() {
