@@ -185,6 +185,11 @@ manual_torch_name_rule_map: dict[
     "torch.distributed.distributed_c10d._get_group_tag": TorchInGraphFunctionVariable,
     "torch.distributed.distributed_c10d.get_process_group_ranks": TorchInGraphFunctionVariable,
     "torch.distributed.destroy_process_group": SkipFunctionVariable,
+    # They change cuDNN fp32 precisions that the global state guard records.
+    # preserve_global_state restores only the matmul one after tracing, so these
+    # must not run while tracing; outside the graph they run on every call.
+    "torch._C._set_cudnn_allow_tf32": SkipFunctionVariable,
+    "torch.backends.cudnn.set_flags": SkipFunctionVariable,
     "torch._utils.is_compiling": TorchInGraphFunctionVariable,
     "torch._utils._chunk_or_narrow_cat": UserFunctionVariable,
     "torch._utils._maybe_view_chunk_cat": UserFunctionVariable,
@@ -1312,7 +1317,6 @@ torch_c_binding_in_graph_functions = dict.fromkeys(
         "torch._C._set_cublas_allow_bf16_reduced_precision_reduction",
         "torch._C._set_cublas_allow_fp16_reduced_precision_reduction",
         "torch._C._set_cublas_allow_tf32",
-        "torch._C._set_cudnn_allow_tf32",
         "torch._C._set_cudnn_benchmark",
         "torch._C._set_cudnn_deterministic",
         "torch._C._set_cudnn_enabled",
@@ -2628,7 +2632,6 @@ torch_non_c_binding_in_graph_functions = dict.fromkeys(
         "torch.backends.cudnn.flags",
         "torch.backends.cudnn.is_acceptable",
         "torch.backends.cudnn.is_available",
-        "torch.backends.cudnn.set_flags",
         "torch.backends.cudnn.version",
         "torch.backends.disable_global_flags",
         "torch.backends.flags_frozen",

@@ -206,6 +206,50 @@ class _FakeTensorModeSerializer:
 
 
 @dataclass
+class _CudaFp32PrecisionSerializer:
+    """
+    The fp32 precisions that Dynamo's global state guard records: CUDA matmul,
+    cuDNN-wide and CUDA conv. The child would otherwise compile under its own.
+    """
+
+    matmul: str
+    cudnn: str
+    conv: str
+
+    @classmethod
+    def serialize(cls) -> _CudaFp32PrecisionSerializer:
+        get = torch._C._get_fp32_precision_getter
+        return cls(get("cuda", "matmul"), get("cuda", "all"), get("cuda", "conv"))
+
+    def _apply(self) -> None:
+        # The legacy getters, which some lowerings read, raise unless the legacy
+        # flags agree with the precisions, and the cuDNN one also unless the RNN
+        # precision matches the conv one. The legacy setters go first because
+        # they overwrite the matmul, conv and RNN precisions.
+        torch._C._set_cublas_allow_tf32(self.matmul == "tf32")
+        torch._C._set_cudnn_allow_tf32(self.conv == "tf32")
+        set_precision = torch._C._set_fp32_precision_setter
+        set_precision("cuda", "all", self.cudnn)
+        set_precision("cuda", "matmul", self.matmul)
+        set_precision("cuda", "conv", self.conv)
+        set_precision("cuda", "rnn", self.conv)
+
+    @contextlib.contextmanager
+    def patch(self) -> Generator[None, None, None]:
+        prior = _CudaFp32PrecisionSerializer.serialize()
+        # Leave matching settings untouched, as they are when the compile runs
+        # in the parent's process.
+        if prior == self:
+            yield
+            return
+        self._apply()
+        try:
+            yield
+        finally:
+            prior._apply()
+
+
+@dataclass
 class _WireProtocolInput:
     """
     For _SerializedFxCompile - encapsulates all the data being transferred
@@ -222,6 +266,7 @@ class _WireProtocolInput:
     # applied in the child instead of reading the worker's own backend
     # config state
     backend_configs: dict[str, dict[str, object]]
+    cuda_fp32_precisions: _CudaFp32PrecisionSerializer
     virtualized: _VirtualizedSerializer
     deterministic_guard_for_testing: (  # type: ignore[name-defined]  # mypy bug
         torch.testing._internal.common_utils.DeterministicGuard | None
@@ -532,6 +577,7 @@ class _SerializedFxCompile(FxCompile):
                     for m in custom_backend_codegen_configs.values()
                     if m is not None
                 },
+                _CudaFp32PrecisionSerializer.serialize(),
                 _VirtualizedSerializer.serialize(),
                 deterministic_guard_for_testing,
                 logger_state,
@@ -584,6 +630,7 @@ class _SerializedFxCompile(FxCompile):
             stack.enter_context(config.patch(input.config))
             for name, values in input.backend_configs.items():
                 stack.enter_context(importlib.import_module(name).patch(values))
+            stack.enter_context(input.cuda_fp32_precisions.patch())
             captured_logs = stack.enter_context(input.logger_state)
             if input.deterministic_guard_for_testing:
                 stack.enter_context(input.deterministic_guard_for_testing)

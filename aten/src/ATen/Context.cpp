@@ -446,6 +446,8 @@ Float32MatmulPrecision Context::float32MatmulPrecision() const {
   return float32_matmul_precision;
 }
 
+// Reads only fp32_precision, so float32PrecisionVersion() tells when the result
+// can change.
 Float32Precision Context::float32Precision(Float32Backend backend, Float32Op op) const {
   std::pair<Float32Backend, Float32Op> key{backend, op};
   auto it = fp32_precision.find(key);
@@ -541,7 +543,10 @@ void Context::setFloat32Precision(Float32Backend backend, Float32Op op, Float32P
       p != Float32Precision::DEFAULT,
       "DEFAULT precision is internal and cannot be set explicitly");
 
-  it->second = p;
+  if (it->second != p) {
+    it->second = p;
+    fp32_precision_version.fetch_add(1, std::memory_order_release);
+  }
 }
 
 static void _warn_once_magma_deprecation() {

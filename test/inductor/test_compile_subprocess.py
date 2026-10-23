@@ -16,13 +16,16 @@ from unittest.mock import patch
 import torch
 import torch.library
 from torch._inductor.compile_fx import _InProcessFxCompile, FxCompile, FxCompileMode
+from torch._inductor.compile_fx_ext import _CudaFp32PrecisionSerializer
 from torch._inductor.graph import GraphLowering
 from torch._inductor.test_case import TestCase
+from torch._inductor.utils import run_and_get_code
 from torch.testing._internal.common_utils import (
     IS_CI,
     IS_WINDOWS,
     isRocmArchAnyOf,
     MI350_ARCH,
+    recover_orig_fp32_precision,
     TEST_WITH_ASAN,
     TEST_WITH_ROCM,
 )
@@ -119,6 +122,62 @@ class TestSubprocess(TestCase):
         self._stack.close()
         TestCase.tearDown(self)
         torch._dynamo.reset()
+
+    def test_cuda_fp32_precision_serializer(self):
+        # The worker compiles under the parent's precisions, with legacy flags
+        # that agree with them, then restores its own.
+        with torch.backends.cudnn.flags(enabled=True, allow_tf32=True):
+            own = _CudaFp32PrecisionSerializer.serialize()
+            for matmul, cudnn, conv in (
+                ("ieee", "tf32", "ieee"),
+                ("none", "none", "ieee"),
+                ("tf32", "none", "tf32"),
+            ):
+                parent = _CudaFp32PrecisionSerializer(matmul, cudnn, conv)
+                with parent.patch():
+                    self.assertEqual(_CudaFp32PrecisionSerializer.serialize(), parent)
+                    legacy = (
+                        torch.backends.cuda.matmul.allow_tf32,
+                        torch.backends.cudnn.allow_tf32,
+                    )
+                    self.assertEqual(legacy, (matmul == "tf32", conv == "tf32"))
+                self.assertEqual(_CudaFp32PrecisionSerializer.serialize(), own)
+
+    @recover_orig_fp32_precision
+    def test_cuda_fp32_precision_serializer_in_the_parent_process(self):
+        # The serialize compile mode patches the parent's own process, where
+        # settings the serializer does not carry must survive.
+        torch.backends.cudnn.rnn.fp32_precision = "ieee"
+        with _CudaFp32PrecisionSerializer.serialize().patch():
+            self.assertEqual(torch.backends.cudnn.rnn.fp32_precision, "ieee")
+        self.assertEqual(torch.backends.cudnn.rnn.fp32_precision, "ieee")
+
+    @requires_gpu()
+    @requires_triton()
+    @unittest.skipIf(
+        not IS_BIG_GPU, "Skipping triton backend only since not big GPU (not enough SM)"
+    )
+    @torch._inductor.config.patch(
+        max_autotune=True, max_autotune_gemm_backends="TRITON"
+    )
+    @recover_orig_fp32_precision
+    def test_mm_template_follows_the_parent_matmul_precision(self):
+        if (
+            GPU_TYPE != "cuda"
+            or torch.version.hip is not None
+            or not torch.cuda.is_tf32_supported()
+        ):
+            raise unittest.SkipTest("requires a CUDA GPU with TF32")
+        a = torch.randn(64, 512, device=GPU_TYPE)
+        b = torch.randn(512, 512, device=GPU_TYPE)
+        # An unset matmul precision inherits the cuDNN-wide one, while an
+        # explicit one does not. The worker's own resolves to "none".
+        for matmul in ("ieee", "none"):
+            torch._dynamo.reset()
+            torch.backends.cuda.matmul.fp32_precision = matmul
+            with torch.backends.cudnn.flags(enabled=True, fp32_precision="tf32"):
+                _, code = run_and_get_code(torch.compile(torch.mm), a, b)
+            self.assertIn(f"ALLOW_TF32 : tl.constexpr = {matmul == 'none'}", code[0])
 
     @requires_gpu()
     @requires_triton()

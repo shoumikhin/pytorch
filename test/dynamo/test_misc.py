@@ -5558,6 +5558,30 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         result = torch.compile(fn, backend="eager", fullgraph=True)(x, config)
         self.assertEqual(result, correct)
 
+    @parametrize("backend", ("aot_eager", "inductor"))
+    @parametrize("setter", ("_set_cudnn_allow_tf32", "set_flags"))
+    def test_cudnn_tf32_setters_run_outside_the_graph(self, backend, setter):
+        # They change precisions that the global state guard records, which
+        # tracing must leave unchanged. Outside the graph they take effect on
+        # every call.
+        def f(x):
+            x = x + 1
+            if setter == "set_flags":
+                torch.backends.cudnn.set_flags(_allow_tf32=False)
+            else:
+                torch._C._set_cudnn_allow_tf32(False)
+            return x * 2
+
+        cnt = CompileCounterWithBackend(backend)
+        compiled = torch.compile(f, backend=cnt)
+        for _ in range(2):
+            with torch.backends.cudnn.flags(enabled=True, allow_tf32=True):
+                self.assertEqual(compiled(torch.ones(3)), torch.full((3,), 4.0))
+                self.assertFalse(torch.backends.cudnn.allow_tf32)
+        self.assertEqual(cnt.frame_count, 2)
+        with self.assertRaisesRegex(Unsupported, "function marked as skipped"):
+            torch.compile(f, backend=backend, fullgraph=True)(torch.ones(3))
+
     @recover_orig_fp32_precision
     def test_global_state_guard_serialization(self):
         GlobalStateGuard = torch._C._dynamo.guards.GlobalStateGuard
@@ -5641,6 +5665,20 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         _test_autocast(torch.float32)
         _test_autocast(torch.float64)
         _test_autocast(torch.bfloat16)
+
+        # A payload written before the conv precisions were recorded loads and
+        # ignores them.
+        torch.backends.cuda.matmul.fp32_precision = "ieee"
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        guards = GlobalStateGuard()
+        pre_conv_json_guards = json.loads(guards.__getstate__())
+        del pre_conv_json_guards["cudnn_conv_precision"]
+        del pre_conv_json_guards["cudnn_fp32_precision"]
+        guards.__setstate__(json.dumps(pre_conv_json_guards))
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        with torch.backends.flags(fp32_precision="tf32"):
+            self.assertTrue(guards.check())
+        self.assertNotIn("cudnn_conv_precision", json.loads(guards.__getstate__()))
 
     def test_type_copy(self):
         def fn(seq):
@@ -12873,6 +12911,37 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         torch.backends.cuda.matmul.fp32_precision = "ieee"
         fn(x)
         self.assertEqual(counter.frame_count, 2)
+
+    @recover_orig_fp32_precision
+    def test_recompile_on_conv_precision_change(self):
+        # Inductor's conv templates read these precisions.
+        counter = CompileCounter()
+
+        @torch.compile(backend=counter)
+        def fn(x):
+            return x + 1
+
+        x = torch.randn(10)
+        # Explicit values, so the generic change below reaches only the
+        # cuDNN-wide precision.
+        torch.backends.cuda.matmul.fp32_precision = "ieee"
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        fn(x)
+        fn(x)
+        self.assertEqual(counter.frame_count, 1)
+
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        fn(x)
+        self.assertEqual(counter.frame_count, 2)
+
+        # The cuDNN-wide precision inherits the generic one.
+        with torch.backends.flags(fp32_precision="tf32"):
+            fn(x)
+        self.assertEqual(counter.frame_count, 3)
+
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        fn(x)
+        self.assertEqual(counter.frame_count, 3)
 
     def test_grad_state_mutated(self):
         prior = torch.is_grad_enabled()

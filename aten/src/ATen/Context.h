@@ -405,6 +405,12 @@ class TORCH_API Context {
   void setAllowTF32CuBLAS(bool /*b*/);
   Float32MatmulPrecision float32MatmulPrecision() const;
   Float32Precision float32Precision(Float32Backend backend, Float32Op op) const;
+  // Bumped after setFloat32Precision changes a stored precision. A caller that
+  // reads it before calling float32Precision() can skip those calls while it is
+  // unchanged. It does not cover the legacy TF32 flags.
+  uint64_t float32PrecisionVersion() const {
+    return fp32_precision_version.load(std::memory_order_acquire);
+  }
   CuBLASReductionOption allowFP16ReductionCuBLAS() const;
   void setAllowFP16ReductionCuBLAS(
       bool allow_reduced_precision,
@@ -586,6 +592,9 @@ class TORCH_API Context {
            ? Float32Precision::NONE
            : Float32Precision::TF32},
   };
+  // Only setFloat32Precision writes fp32_precision after construction, and it
+  // bumps this whenever it changes an entry.
+  std::atomic<uint64_t> fp32_precision_version = 0;
 
   Allocator* prev_allocator_ptr_{nullptr};
 };
