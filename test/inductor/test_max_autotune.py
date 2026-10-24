@@ -42,6 +42,8 @@ from torch._inductor.autotune_process import (
     use_pipelined_autotuning,
 )
 from torch._inductor.codegen.common import WorkspaceArg
+from torch._inductor.compile_fx import FxCompile, FxCompileMode
+from torch._inductor.compile_fx_subproc import _SubprocessFxCompile
 from torch._inductor.graph import GraphLowering
 from torch._inductor.heuristics.registry import (
     get_registered_heuristic_class,
@@ -89,6 +91,7 @@ from torch.testing._internal.common_utils import (
     IS_WINDOWS,
     parametrize,
     random_matrix_with_scaled_reduction_dim,
+    recover_orig_fp32_precision,
     skipIfRocm,
     skipIfTorchInductor,
     TEST_WITH_ROCM,
@@ -4001,6 +4004,77 @@ class TestMaxAutotune(TestCase):
         # No truncation casts should exist since there are no fused epilogue ops
         self.assertNotIn("acc.to(tl.float16)", code[0])
         self.assertNotIn("acc.to(tl.bfloat16)", code[0])
+
+
+@instantiate_parametrized_tests
+class TestConvTemplateTF32(TestCase):
+    """ALLOW_TF32 of the Triton conv templates, in-process and in subprocess compiles."""
+
+    @unittest.skipUnless(
+        HAS_GPU and TEST_WITH_ROCM, "Triton backward conv templates run on ROCm"
+    )
+    @parametrize("conv_precision", ("ieee", "tf32"))
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_bwd_weight_backends="TRITON",
+        max_autotune_conv_bwd_input_backends="TRITON",
+    )
+    @recover_orig_fp32_precision
+    def test_conv_backward_templates_follow_the_conv_precision(self, conv_precision):
+        # An "ieee" conv precision set alone made the legacy
+        # torch.backends.cudnn.allow_tf32 getter, which the lowering read, raise.
+        torch.backends.cudnn.conv.fp32_precision = conv_precision
+
+        def conv_backward(grad_output, x, w):
+            return torch.ops.aten.convolution_backward.default(
+                grad_output,
+                x,
+                w,
+                [32],
+                [1, 1],
+                [1, 1],
+                [1, 1],
+                False,
+                [0, 0],
+                1,
+                [True, True, False],
+            )
+
+        x = torch.randn(2, 32, 16, 16, device=GPU_TYPE)
+        w = torch.randn(32, 32, 3, 3, device=GPU_TYPE)
+        grad_output = torch.randn(2, 32, 16, 16, device=GPU_TYPE)
+        _, code = run_and_get_code(torch.compile(conv_backward), grad_output, x, w)
+        expect_tf32 = conv_precision == "tf32" and torch.cuda.is_tf32_supported()
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {expect_tf32}", code[0])
+        self.assertNotIn(f"ALLOW_TF32 : tl.constexpr = {not expect_tf32}", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @config.patch(max_autotune=True, max_autotune_gemm_backends="TRITON")
+    @recover_orig_fp32_precision
+    def test_subprocess_compile_uses_the_parent_matmul_precision(self):
+        if torch.version.hip is not None or not torch.cuda.is_tf32_supported():
+            raise unittest.SkipTest("requires a CUDA GPU with TF32")
+        # Large enough for the CUDA matmul templates' TF32 shape threshold.
+        a = torch.randn(64, 1024, device=GPU_TYPE)
+        b = torch.randn(1024, 1024, device=GPU_TYPE)
+        # An unset matmul precision inherits the cuDNN-wide one, while an
+        # explicit one does not. The worker's own resolves to "none".
+        for matmul in ("ieee", "none"):
+            torch._dynamo.reset()
+            FxCompile._reset_stats()
+            torch.backends.cuda.matmul.fp32_precision = matmul
+            with (
+                mock.patch(
+                    "torch._inductor.compile_fx.fx_compile_mode",
+                    FxCompileMode.SUBPROCESS,
+                ),
+                torch.backends.cudnn.flags(enabled=True, fp32_precision="tf32"),
+            ):
+                _, code = run_and_get_code(torch.compile(torch.mm), a, b)
+            self.assertEqual(
+                FxCompile._compile_stats[_SubprocessFxCompile].codegen_and_compile, 1
+            )
+            self.assertIn(f"ALLOW_TF32 : tl.constexpr = {matmul == 'none'}", code[0])
 
 
 @instantiate_parametrized_tests

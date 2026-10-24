@@ -5558,6 +5558,54 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         result = torch.compile(fn, backend="eager", fullgraph=True)(x, config)
         self.assertEqual(result, correct)
 
+    @parametrize("backend", ("aot_eager", "inductor"))
+    @parametrize("setter", ("_set_cudnn_allow_tf32", "_set_cudnn_enabled", "set_flags"))
+    @recover_orig_fp32_precision
+    def test_cudnn_setters_run_outside_the_graph(self, backend, setter):
+        # They change settings that the global state guard records, which
+        # tracing must leave unchanged. Outside the graph they take effect on
+        # every call.
+        def f(x):
+            x = x + 1
+            if setter == "set_flags":
+                torch.backends.cudnn.set_flags(_allow_tf32=False)
+            elif setter == "_set_cudnn_enabled":
+                torch._C._set_cudnn_enabled(False)
+            else:
+                torch._C._set_cudnn_allow_tf32(False)
+            return x * 2
+
+        cnt = CompileCounterWithBackend(backend)
+        compiled = torch.compile(f, backend=cnt)
+        for _ in range(2):
+            with torch.backends.cudnn.flags(enabled=True, allow_tf32=True):
+                self.assertEqual(compiled(torch.ones(3)), torch.full((3,), 4.0))
+                if setter == "_set_cudnn_enabled":
+                    self.assertFalse(torch.backends.cudnn.enabled)
+                else:
+                    self.assertFalse(torch.backends.cudnn.allow_tf32)
+        self.assertEqual(cnt.frame_count, 2)
+        with self.assertRaisesRegex(Unsupported, "Call to a cuDNN setting setter"):
+            torch.compile(f, backend=backend, fullgraph=True)(torch.ones(3))
+
+    @recover_orig_fp32_precision
+    def test_cudnn_flags_context_in_compiled_fn(self):
+        # The context manager graph-breaks before it changes any setting, so
+        # tracing leaves the guarded settings alone.
+        def f(x):
+            with torch.backends.cudnn.flags(enabled=False, allow_tf32=False):
+                x = x + 1
+            return x * 2
+
+        settings = (torch.backends.cudnn.enabled, torch.backends.cudnn.allow_tf32)
+        cnt = CompileCounter()
+        self.assertEqual(
+            torch.compile(f, backend=cnt)(torch.ones(3)), torch.full((3,), 4.0)
+        )
+        self.assertEqual(
+            (torch.backends.cudnn.enabled, torch.backends.cudnn.allow_tf32), settings
+        )
+
     @recover_orig_fp32_precision
     def test_global_state_guard_serialization(self):
         GlobalStateGuard = torch._C._dynamo.guards.GlobalStateGuard
@@ -5568,10 +5616,14 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         samples = []
         # Test on non autocast state and autocast cache states.
         self.assertIn("autocast_state", json_guards)
+        has_cudnn = torch.backends.cudnn.is_available() and torch.version.hip is None
         for key, value in json_guards.items():
             # Compatibility alias; cuda_matmul_precision is authoritative in
             # payloads written by current versions.
             if key == "allow_tf32":
+                continue
+            # The guard compares the cuDNN switch only on CUDA builds with cuDNN.
+            if key == "cudnn_enabled" and not has_cudnn:
                 continue
             if type(value) is int:
                 variant = value + 1
@@ -5641,6 +5693,38 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         _test_autocast(torch.float32)
         _test_autocast(torch.float64)
         _test_autocast(torch.bfloat16)
+
+        # A payload written before the cuDNN settings were recorded loads and
+        # ignores them.
+        torch.backends.cuda.matmul.fp32_precision = "ieee"
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        guards = GlobalStateGuard()
+        pre_conv_json_guards = json.loads(guards.__getstate__())
+        del pre_conv_json_guards["cudnn_conv_precision"]
+        del pre_conv_json_guards["cudnn_fp32_precision"]
+        del pre_conv_json_guards["cudnn_enabled"]
+        guards.__setstate__(json.dumps(pre_conv_json_guards))
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        with torch.backends.flags(fp32_precision="tf32"):
+            self.assertTrue(guards.check())
+        with torch.backends.cudnn.flags(enabled=not torch.backends.cudnn.enabled):
+            self.assertTrue(guards.check())
+        self.assertNotIn("cudnn_conv_precision", json.loads(guards.__getstate__()))
+
+    @recover_orig_fp32_precision
+    def test_global_state_guard_payload_loads_across_cudnn_builds(self):
+        # The payload records the raw cuDNN switch, which builds with and
+        # without cuDNN write alike.
+        GlobalStateGuard = torch._C._dynamo.guards.GlobalStateGuard
+        has_cudnn = torch.backends.cudnn.is_available() and torch.version.hip is None
+        with torch.backends.cudnn.flags(enabled=True):
+            json_guards = json.loads(GlobalStateGuard().__getstate__())
+            self.assertIs(json_guards["cudnn_enabled"], True)
+            # One saved with cuDNN disabled fails only where cuDNN exists.
+            json_guards["cudnn_enabled"] = False
+            guards = GlobalStateGuard()
+            guards.__setstate__(json.dumps(json_guards))
+            self.assertIs(guards.check(), not has_cudnn)
 
     def test_type_copy(self):
         def fn(seq):
@@ -12873,6 +12957,43 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         torch.backends.cuda.matmul.fp32_precision = "ieee"
         fn(x)
         self.assertEqual(counter.frame_count, 2)
+
+    @recover_orig_fp32_precision
+    def test_recompile_on_cudnn_settings_change(self):
+        # Inductor's conv templates may read these settings.
+        counter = CompileCounter()
+
+        @torch.compile(backend=counter)
+        def fn(x):
+            return x + 1
+
+        x = torch.randn(10)
+        # Explicit values, so the generic change below reaches only the
+        # cuDNN-wide precision.
+        torch.backends.cuda.matmul.fp32_precision = "ieee"
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        fn(x)
+        fn(x)
+        self.assertEqual(counter.frame_count, 1)
+
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        fn(x)
+        self.assertEqual(counter.frame_count, 2)
+
+        # The cuDNN-wide precision inherits the generic one.
+        with torch.backends.flags(fp32_precision="tf32"):
+            fn(x)
+        self.assertEqual(counter.frame_count, 3)
+
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        fn(x)
+        self.assertEqual(counter.frame_count, 3)
+
+        # The guard compares the switch only on CUDA builds with cuDNN.
+        has_cudnn = torch.backends.cudnn.is_available() and torch.version.hip is None
+        with torch.backends.cudnn.flags(enabled=not torch.backends.cudnn.enabled):
+            fn(x)
+        self.assertEqual(counter.frame_count, 4 if has_cudnn else 3)
 
     def test_grad_state_mutated(self):
         prior = torch.is_grad_enabled()

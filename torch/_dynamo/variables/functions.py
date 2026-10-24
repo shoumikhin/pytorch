@@ -2845,6 +2845,26 @@ class SkipFunctionVariable(VariableTracker):
                     *graph_break_hints.SUPPORTABLE,
                 ],
             )
+        elif self.value in (
+            torch._C._set_cudnn_allow_tf32,
+            torch._C._set_cudnn_enabled,
+            torch.backends.cudnn.set_flags,
+        ):
+            setter = cast(Callable[..., Any], self.value)
+            fn_name = f"{setter.__module__}.{setter.__name__}"
+            unimplemented(
+                gb_type="Call to a cuDNN setting setter",
+                context=f"Called `{fn_name}()` inside a compiled region",
+                explanation=(
+                    f"Dynamo graph breaks on `{fn_name}()` because it changes "
+                    "cuDNN settings that the global state guard may record, which "
+                    "must not change while tracing."
+                ),
+                hints=[
+                    f"Move the `{fn_name}()` call outside the compiled function if the graph break is undesirable.",
+                    *graph_break_hints.SUPPORTABLE,
+                ],
+            )
         elif self.value is torch._dynamo.graph_break:
             graph_break_msg = kwargs.get("msg")
             if graph_break_msg:
