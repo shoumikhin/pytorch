@@ -1381,6 +1381,16 @@
       ]
     }
   ],
+  "GB7715": [
+    {
+      "Gb_type": "Call to a cuDNN setting setter",
+      "Context": "Called `{fn_name}()` inside a compiled region",
+      "Explanation": "Dynamo graph breaks on `{fn_name}()` because it changes cuDNN settings that the global state guard may record, which must not change while tracing.",
+      "Hints": [
+        "Move the `{fn_name}()` call outside the compiled function if the graph break is undesirable."
+      ]
+    }
+  ],
   "GB0083": [
     {
       "Gb_type": "Module-level backwards hooks require compiled autograd.",

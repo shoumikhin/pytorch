@@ -6580,12 +6580,6 @@ for dtype in (torch.int32, torch.int64):
         out_channels = channels_groups[1]
         groups = channels_groups[2]
 
-        if torch._inductor.compile_fx.fx_compile_mode == FxCompileMode.SUBPROCESS:
-            # TODO: Remove this workaround once TF32 settings are properly passed to subprocess
-            # Currently, subprocess mode starts with default TF32 settings (cudnn.allow_tf32=True)
-            # even if parent process has set allow_tf32=False.
-            self.skipTest("Expected failure under subprocess compile mode")
-
         def fn(grad_output, inp, weight):
             conv_backward = torch.ops.aten.convolution_backward.default(
                 grad_output,
@@ -6654,9 +6648,6 @@ for dtype in (torch.int32, torch.int64):
     def test_conv2d_backward_input_layout(self, nhwc_weight: bool, nhwc_input: bool):
         in_channels, out_channels, groups = 3, 4, 1
         stride, dilation, padding, kernel = 1, 1, 1, 3
-
-        if torch._inductor.compile_fx.fx_compile_mode == FxCompileMode.SUBPROCESS:
-            self.skipTest("Expected failure under subprocess compile mode")
 
         def fn(grad_output, inp, weight):
             return torch.ops.aten.convolution_backward.default(

@@ -16,6 +16,7 @@ from unittest.mock import patch
 import torch
 import torch.library
 from torch._inductor.compile_fx import _InProcessFxCompile, FxCompile, FxCompileMode
+from torch._inductor.compile_fx_ext import _TF32SettingsSerializer
 from torch._inductor.graph import GraphLowering
 from torch._inductor.test_case import TestCase
 from torch.testing._internal.common_utils import (
@@ -23,6 +24,7 @@ from torch.testing._internal.common_utils import (
     IS_WINDOWS,
     isRocmArchAnyOf,
     MI350_ARCH,
+    recover_orig_fp32_precision,
     TEST_WITH_ASAN,
     TEST_WITH_ROCM,
 )
@@ -119,6 +121,36 @@ class TestSubprocess(TestCase):
         self._stack.close()
         TestCase.tearDown(self)
         torch._dynamo.reset()
+
+    @recover_orig_fp32_precision
+    def test_tf32_settings_serializer(self):
+        # The worker compiles under the parent's settings, with legacy flags
+        # that agree with them, then restores its own.
+        with torch.backends.cudnn.flags(enabled=True, allow_tf32=True):
+            own = _TF32SettingsSerializer.serialize()
+            for matmul, cudnn, conv, cudnn_enabled in (
+                ("ieee", "tf32", "ieee", True),
+                ("none", "none", "ieee", False),
+                ("tf32", "none", "tf32", False),
+            ):
+                parent = _TF32SettingsSerializer(matmul, cudnn, conv, cudnn_enabled)
+                with parent.patch():
+                    self.assertEqual(_TF32SettingsSerializer.serialize(), parent)
+                    legacy = (
+                        torch.backends.cuda.matmul.allow_tf32,
+                        torch.backends.cudnn.allow_tf32,
+                    )
+                    self.assertEqual(legacy, (matmul == "tf32", conv == "tf32"))
+                self.assertEqual(_TF32SettingsSerializer.serialize(), own)
+
+    @recover_orig_fp32_precision
+    def test_tf32_settings_serializer_in_the_parent_process(self):
+        # The serialize compile mode patches the parent's own process, where
+        # settings the serializer does not carry must survive.
+        torch.set_float32_matmul_precision("medium")
+        with _TF32SettingsSerializer.serialize().patch():
+            self.assertEqual(torch.get_float32_matmul_precision(), "medium")
+        self.assertEqual(torch.get_float32_matmul_precision(), "medium")
 
     @requires_gpu()
     @requires_triton()

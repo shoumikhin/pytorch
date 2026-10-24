@@ -206,6 +206,60 @@ class _FakeTensorModeSerializer:
 
 
 @dataclass
+class _TF32SettingsSerializer:
+    """
+    The settings that the Triton templates' ALLOW_TF32 may depend on and that
+    Dynamo's global state guard records: the CUDA matmul, cuDNN-wide and CUDA
+    conv fp32 precisions, and whether cuDNN is enabled. The child would
+    otherwise compile under its own, and the parent would cache that code under
+    its own key.
+    """
+
+    matmul: str
+    cudnn: str
+    conv: str
+    cudnn_enabled: bool
+
+    @classmethod
+    def serialize(cls) -> _TF32SettingsSerializer:
+        get = torch._C._get_fp32_precision_getter
+        return cls(
+            get("cuda", "matmul"),
+            get("cuda", "all"),
+            get("cuda", "conv"),
+            torch.backends.cudnn.enabled,
+        )
+
+    def _apply(self) -> None:
+        # The legacy getters raise unless the legacy flags agree with the
+        # precisions, and the cuDNN one also unless the RNN precision matches
+        # the conv one. The legacy setters go first because they overwrite the
+        # matmul, conv and RNN precisions.
+        torch._C._set_cublas_allow_tf32(self.matmul == "tf32")
+        torch._C._set_cudnn_allow_tf32(self.conv == "tf32")
+        set_precision = torch._C._set_fp32_precision_setter
+        set_precision("cuda", "all", self.cudnn)
+        set_precision("cuda", "matmul", self.matmul)
+        set_precision("cuda", "conv", self.conv)
+        set_precision("cuda", "rnn", self.conv)
+        torch._C._set_cudnn_enabled(self.cudnn_enabled)
+
+    @contextlib.contextmanager
+    def patch(self) -> Generator[None, None, None]:
+        prior = _TF32SettingsSerializer.serialize()
+        # Leave matching settings untouched, as they are when the compile runs
+        # in the parent's process.
+        if prior == self:
+            yield
+            return
+        try:
+            self._apply()
+            yield
+        finally:
+            prior._apply()
+
+
+@dataclass
 class _WireProtocolInput:
     """
     For _SerializedFxCompile - encapsulates all the data being transferred
@@ -222,6 +276,7 @@ class _WireProtocolInput:
     # applied in the child instead of reading the worker's own backend
     # config state
     backend_configs: dict[str, dict[str, object]]
+    tf32_settings: _TF32SettingsSerializer
     virtualized: _VirtualizedSerializer
     deterministic_guard_for_testing: (  # type: ignore[name-defined]  # mypy bug
         torch.testing._internal.common_utils.DeterministicGuard | None
@@ -532,6 +587,7 @@ class _SerializedFxCompile(FxCompile):
                     for m in custom_backend_codegen_configs.values()
                     if m is not None
                 },
+                _TF32SettingsSerializer.serialize(),
                 _VirtualizedSerializer.serialize(),
                 deterministic_guard_for_testing,
                 logger_state,
@@ -584,6 +640,7 @@ class _SerializedFxCompile(FxCompile):
             stack.enter_context(config.patch(input.config))
             for name, values in input.backend_configs.items():
                 stack.enter_context(importlib.import_module(name).patch(values))
+            stack.enter_context(input.tf32_settings.patch())
             captured_logs = stack.enter_context(input.logger_state)
             if input.deterministic_guard_for_testing:
                 stack.enter_context(input.deterministic_guard_for_testing)
