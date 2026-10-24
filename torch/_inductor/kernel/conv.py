@@ -5,6 +5,7 @@ import logging
 from typing import TYPE_CHECKING, TypedDict
 
 import torch
+from torch._dynamo.device_interface import get_interface_for_device
 from torch._inductor.codegen.rocm.ck_conv_template import CKGroupedConvFwdTemplate
 
 from .. import config, ir
@@ -42,6 +43,17 @@ log = logging.getLogger(__name__)
 
 
 aten = torch.ops.aten
+
+
+def conv_template_allow_tf32(device_type: str | None, /) -> bool:
+    """Whether a Triton conv template should use TF32, per the device interface."""
+    if device_type is None:
+        return False
+    try:
+        iface = get_interface_for_device(device_type)
+    except NotImplementedError:
+        return False
+    return bool(iface.conv_allow_tf32())
 
 
 @SymbolicGridFn
@@ -607,6 +619,7 @@ def convolution(
         bias.freeze_layout()
         V.graph.sizevars.guard_int_seq(bias.get_size())
 
+    template_allow_tf32 = conv_template_allow_tf32(device_type)
     choices = []
     if torch._inductor.utils._use_conv_autotune_backend("ATEN"):
         choices = [
@@ -681,7 +694,7 @@ def convolution(
                     # TODO(jansel): try unroll for bigger kernels once fixed:
                     #               https://github.com/triton-lang/triton/issues/1254
                     UNROLL=unroll,
-                    ALLOW_TF32=torch.backends.cudnn.fp32_precision == "tf32",
+                    ALLOW_TF32=template_allow_tf32,
                     num_stages=cfg.num_stages,
                     num_warps=num_warps,
                     **cfg.kwargs,
@@ -704,7 +717,7 @@ def convolution(
                     # TODO(jansel): try unroll for bigger kernels once fixed:
                     #               https://github.com/triton-lang/triton/issues/1254
                     UNROLL=unroll,
-                    ALLOW_TF32=torch.backends.cudnn.fp32_precision == "tf32",
+                    ALLOW_TF32=template_allow_tf32,
                     num_stages=cfg.num_stages,
                     num_warps=num_warps,
                     **cfg.kwargs,
@@ -746,7 +759,7 @@ def convolution(
                 DILATION_H=dilation[0],
                 DILATION_W=dilation[1],
                 GROUPS=groups,
-                ALLOW_TF32=torch.backends.cudnn.fp32_precision == "tf32",
+                ALLOW_TF32=template_allow_tf32,
                 num_stages=cfg.num_stages,
                 num_warps=cfg.num_warps,
                 **cfg.kwargs,
@@ -1101,6 +1114,9 @@ def convolution_backward_lowering(
 
     conv_configs = V.choices.get_conv_configs(device_type)
     dtype_size = input.get_dtype().itemsize
+    # The op-less torch.backends.cudnn.allow_tf32 raises unless the conv and
+    # RNN precisions agree with the legacy flag.
+    allow_tf32 = torch.backends.cudnn.conv.fp32_precision == "tf32"  # type: ignore[attr-defined]
 
     has_triton_dw_choices = False
     dw = None
@@ -1149,7 +1165,7 @@ def convolution_backward_lowering(
                         DILATION_H=dilation[0],
                         DILATION_W=dilation[1],
                         GROUPS=groups,
-                        ALLOW_TF32=torch.backends.cudnn.allow_tf32,
+                        ALLOW_TF32=allow_tf32,
                         num_stages=cfg.num_stages,
                         num_warps=cfg.num_warps,
                         **cfg.kwargs,
@@ -1205,7 +1221,7 @@ def convolution_backward_lowering(
                         DILATION_H=dilation[0],
                         DILATION_W=dilation[1],
                         GROUPS=groups,
-                        ALLOW_TF32=torch.backends.cudnn.allow_tf32,
+                        ALLOW_TF32=allow_tf32,
                         num_stages=cfg.num_stages,
                         num_warps=cfg.num_warps,
                         **cfg.kwargs,
