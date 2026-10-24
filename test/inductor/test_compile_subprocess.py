@@ -17,6 +17,7 @@ import torch
 import torch.library
 from torch._inductor.compile_fx import _InProcessFxCompile, FxCompile, FxCompileMode
 from torch._inductor.compile_fx_ext import _CudaFp32PrecisionSerializer
+from torch._inductor.compile_fx_subproc import _SubprocessFxCompile
 from torch._inductor.graph import GraphLowering
 from torch._inductor.test_case import TestCase
 from torch._inductor.utils import run_and_get_code
@@ -178,6 +179,34 @@ class TestSubprocess(TestCase):
             with torch.backends.cudnn.flags(enabled=True, fp32_precision="tf32"):
                 _, code = run_and_get_code(torch.compile(torch.mm), a, b)
             self.assertIn(f"ALLOW_TF32 : tl.constexpr = {matmul == 'none'}", code[0])
+
+    @requires_gpu()
+    @requires_triton()
+    @unittest.skipIf(
+        not IS_BIG_GPU, "Skipping triton backend only since not big GPU (not enough SM)"
+    )
+    @torch._inductor.config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    def test_conv_template_follows_the_parent_conv_precision(self):
+        if (
+            GPU_TYPE != "cuda"
+            or torch.version.hip is not None
+            or not torch.cuda.is_tf32_supported()
+        ):
+            raise unittest.SkipTest("requires a CUDA GPU with TF32")
+        x = torch.randn(2, 32, 32, 32, device=GPU_TYPE)
+        w = torch.randn(32, 32, 3, 3, device=GPU_TYPE)
+        # The worker's own conv precision is TF32.
+        with torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
+            _, code = run_and_get_code(torch.compile(torch.nn.functional.conv2d), x, w)
+        self.assertEqual(
+            FxCompile._compile_stats[_SubprocessFxCompile].codegen_and_compile, 1
+        )
+        self.assertIn("ALLOW_TF32 : tl.constexpr = False", code[0])
+        self.assertNotIn("ALLOW_TF32 : tl.constexpr = True", code[0])
 
     @requires_gpu()
     @requires_triton()

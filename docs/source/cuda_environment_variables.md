@@ -29,4 +29,4 @@ For more information on CUDA runtime environment variables, see [CUDA Environmen
 | `CUDNN_CONV_WSCAP_DBG` | Similar to `CUBLAS_WORKSPACE_CONFIG`, this environment variable is used to set the workspace configuration for cuDNN per allocation. |
 | `CUBLASLT_WORKSPACE_SIZE` | Similar to `CUBLAS_WORKSPACE_CONFIG`, this environment variable is used to set the workspace size for cuBLASLT. |
 | `CUDNN_ERRATA_JSON_FILE` | Can be set to a file path for an errata filter that can be passed to cuDNN to avoid specific engine configs, used primarily for debugging or to hardcode autotuning. |
-| `NVIDIA_TF32_OVERRIDE` | If set to `0`, disables TF32 globally across all kernels, overriding all PyTorch settings. |
+| `NVIDIA_TF32_OVERRIDE` | If set to `0`, disables TF32 in NVIDIA libraries such as cuBLAS and cuDNN, overriding all PyTorch settings. Triton kernels that `torch.compile` generates do not read it and follow the PyTorch TF32 settings. |

@@ -231,7 +231,9 @@ class DeviceInterface:
         """Whether the backend permits the convolution lowering's Triton
         templates to set ALLOW_TF32.
 
-        The default reads the cuDNN-wide fp32 precision, for backward
+        The call site also keeps depthwise convolutions on NVIDIA GPUs, and an
+        aten._convolution with allow_tf32=False or cudnn_enabled=False, in full
+        precision. The default reads the cuDNN-wide fp32 precision, for backward
         compatibility: these templates read it before this hook existed. The FX
         graph cache key records the result per device. Dynamo's global state
         guard records only the CUDA matmul, CUDA conv and cuDNN-wide fp32
@@ -454,6 +456,18 @@ class CudaInterface(DeviceInterface):
     @staticmethod
     def allow_tf32() -> bool:
         return torch.backends.cuda.matmul.fp32_precision == "tf32"
+
+    @staticmethod
+    def conv_allow_tf32() -> bool:
+        # ROCm keeps the setting its templates read before; its eager
+        # convolutions run on MIOpen, which reads neither precision.
+        if torch.version.hip is not None:
+            return DeviceInterface.conv_allow_tf32()
+        # Eager cuDNN convolutions read the conv precision, which is TF32 by default
+        # while the cuDNN-wide setting stays "none". With cuDNN disabled, eager
+        # runs most convolutions as a matmul under the matmul precision instead;
+        # the templates keep following the conv precision.
+        return torch.backends.cudnn.conv.fp32_precision == "tf32"  # type: ignore[attr-defined]
 
     @staticmethod
     def raise_if_triton_unavailable(device: torch.types.Device = None) -> None:

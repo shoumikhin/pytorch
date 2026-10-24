@@ -89,6 +89,7 @@ from torch.testing._internal.common_utils import (
     IS_WINDOWS,
     parametrize,
     random_matrix_with_scaled_reduction_dim,
+    recover_orig_fp32_precision,
     skipIfRocm,
     skipIfTorchInductor,
     TEST_WITH_ROCM,
@@ -1696,6 +1697,147 @@ class TestMaxAutotune(TestCase):
             torch.compile(m)(inp)
 
         self.assertIn("NoValidChoicesError", str(context.exception))
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @parametrize(
+        "kind",
+        (
+            "regular",
+            "regular_3d",
+            "single_channel",
+            "grouped",
+            "depthwise",
+            "depthwise_x2",
+        ),
+    )
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    def test_conv_template_follows_the_default_conv_precision(self, kind):
+        # Eager cuDNN convolutions use TF32 by default while the cuDNN-wide
+        # precision stays "none". CUDA keeps depthwise convolutions in full
+        # precision, ROCm follows the cuDNN-wide precision, and Triton templates
+        # never use TF32 on a GPU that has none.
+        ndim = 3 if kind == "regular_3d" else 2
+        in_channels = 1 if kind == "single_channel" else 32
+        # grouped has 8 input channels per group; depthwise_x2 has two output
+        # channels per input channel.
+        groups = {"grouped": 4, "depthwise": 32, "depthwise_x2": 32}.get(kind, 1)
+        out_channels = 64 if kind == "depthwise_x2" else 32
+        actual, expected, code = self._compile_small_integer_conv(
+            ndim, in_channels, out_channels, groups
+        )
+        self.assertEqual(actual, expected)
+        expect_tf32 = (
+            not kind.startswith("depthwise")
+            and torch.version.hip is None
+            and torch.cuda.is_tf32_supported()
+        )
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {expect_tf32}", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @parametrize("ndim", (2, 3))
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    @recover_orig_fp32_precision
+    def test_conv_template_follows_an_ieee_conv_precision(self, ndim):
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        actual, expected, code = self._compile_small_integer_conv(ndim, 32, 32, 1)
+        self.assertEqual(actual, expected)
+        self.assertIn("ALLOW_TF32 : tl.constexpr = False", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @parametrize("cudnn_enabled", (False, True))
+    @parametrize("allow_tf32", (False, True))
+    @parametrize("with_bias", (False, True))
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    def test_conv_template_follows_the_convolution_flags(
+        self, cudnn_enabled, allow_tf32, with_bias
+    ):
+        # Both the conv and the cuDNN-wide precision allow TF32 here, so the
+        # aten._convolution flags decide.
+        aten_flags = (cudnn_enabled, allow_tf32)
+        with torch.backends.cudnn.flags(
+            enabled=True, allow_tf32=True, fp32_precision="tf32"
+        ):
+            actual, expected, code = self._compile_small_integer_conv(
+                2, 32, 32, 1, with_bias=with_bias, aten_flags=aten_flags
+            )
+        self.assertEqual(actual, expected)
+        expect_tf32 = cudnn_enabled and allow_tf32 and torch.cuda.is_tf32_supported()
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {expect_tf32}", code[0])
+        self.assertNotIn(f"ALLOW_TF32 : tl.constexpr = {not expect_tf32}", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    def test_conv_template_recompiles_when_the_conv_precision_changes(self):
+        # Dynamo recompiles and the FX graph cache key changes, so the second
+        # compile generates the template under the new precision. ROCm
+        # templates follow the cuDNN-wide precision instead.
+        x = torch.randn(2, 32, 16, 16, device=GPU_TYPE)
+        w = torch.randn(32, 32, 3, 3, device=GPU_TYPE)
+        compiled = torch.compile(torch.nn.functional.conv2d)
+        codes: list[str] = []
+        with mock.patch.object(GraphLowering, "save_output_code", codes.append):
+            for allow_tf32 in (True, False):
+                with torch.backends.cudnn.flags(enabled=True, allow_tf32=allow_tf32):
+                    compiled(x, w)
+        self.assertEqual(len(codes), 2)
+        expect_tf32 = torch.version.hip is None and torch.cuda.is_tf32_supported()
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {expect_tf32}", codes[0])
+        self.assertIn("ALLOW_TF32 : tl.constexpr = False", codes[1])
+
+    def _compile_small_integer_conv(
+        self, ndim, in_channels, out_channels, groups, with_bias=False, aten_flags=None
+    ):
+        # Small integers are exact in TF32, so both precisions match eager.
+        # aten_flags, a (cudnn_enabled, allow_tf32) pair, calls aten._convolution
+        # instead of the functional conv.
+        spatial = (16, 16) if ndim == 2 else (8, 8, 8)
+        x = torch.randint(-2, 3, (2, in_channels, *spatial), device=GPU_TYPE).float()
+        shape = (out_channels, in_channels // groups, *(3,) * ndim)
+        w = torch.randint(-2, 3, shape, device=GPU_TYPE).float()
+        b = torch.randint(-2, 3, (out_channels,), device=GPU_TYPE).float()
+        b = b if with_bias else None
+        functional_conv = (
+            torch.nn.functional.conv2d if ndim == 2 else torch.nn.functional.conv3d
+        )
+
+        def conv(x, w, b):
+            if aten_flags is None:
+                return functional_conv(x, w, b, groups=groups)
+            cudnn_enabled, allow_tf32 = aten_flags
+            return torch._convolution(
+                x,
+                w,
+                b,
+                stride=[1] * ndim,
+                padding=[0] * ndim,
+                dilation=[1] * ndim,
+                transposed=False,
+                output_padding=[0] * ndim,
+                groups=groups,
+                benchmark=False,
+                deterministic=False,
+                cudnn_enabled=cudnn_enabled,
+                allow_tf32=allow_tf32,
+            )
+
+        actual, code = run_and_get_code(torch.compile(conv), x, w, b)
+        return actual, conv(x, w, b), code
 
     def test_non_contiguous_input_mm(self):
         """

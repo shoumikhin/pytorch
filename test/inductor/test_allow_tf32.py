@@ -93,6 +93,19 @@ class TestAllowTf32Interface(TestCase):
         with torch.backends.flags(fp32_precision="ieee"):
             self.assertFalse(DeviceInterface.conv_allow_tf32())
 
+    @recover_orig_fp32_precision
+    def test_cuda_conv_allow_tf32_follows_conv_precision(self):
+        # Eager cuDNN convolutions use TF32 by default while the cuDNN-wide
+        # precision stays "none". ROCm keeps following the cuDNN-wide one, which
+        # inherits the generic one.
+        cuda = torch.version.hip is None
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        with torch.backends.flags(fp32_precision="ieee"):
+            self.assertEqual(CudaInterface.conv_allow_tf32(), cuda)
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        with torch.backends.flags(fp32_precision="tf32"):
+            self.assertEqual(CudaInterface.conv_allow_tf32(), not cuda)
+
     def test_xpu_allow_tf32_matches_mkldnn(self):
         # Without USE_XPU the raw flag is None. The interface still returns a bool.
         self.assertEqual(
@@ -168,6 +181,19 @@ class TestAllowTf32ExtraKwargs(TestCase):
         self.assertFalse(conv_template_allow_tf32(None))
         self.assertFalse(conv_template_allow_tf32("meta"))
 
+    @recover_orig_fp32_precision
+    def test_conv_template_keeps_cuda_depthwise_convs_in_full_precision(self):
+        # Other devices follow their interface for depthwise convolutions too.
+        register_interface_for_device("privateuseone", _AllowTf32Interface)
+        self.assertTrue(conv_template_allow_tf32("privateuseone", depthwise=True))
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        with torch.backends.flags(fp32_precision="tf32"):
+            self.assertTrue(conv_template_allow_tf32("cuda"))
+            self.assertEqual(
+                conv_template_allow_tf32("cuda", depthwise=True),
+                torch.version.hip is not None,
+            )
+
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     def test_cuda_small_shapes_disable_allow_tf32(self):
         orig = torch.backends.cuda.matmul.fp32_precision
@@ -226,6 +252,18 @@ class TestAllowTf32ExtraKwargs(TestCase):
             torch.backends.cuda.matmul.fp32_precision = orig
         self.assertIn(("cuda", True), enabled.mm_template_allow_tf32)
         self.assertIn(("cuda", False), disabled.mm_template_allow_tf32)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
+    @recover_orig_fp32_precision
+    def test_cache_key_tracks_cuda_conv_allow_tf32(self):
+        tensor = torch.zeros(2, 2, device="cuda")
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        enabled = FxGraphHashDetails(None, [tensor], {}, [])
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        disabled = FxGraphHashDetails(None, [tensor], {}, [])
+        expected = torch.version.hip is None
+        self.assertIn(("cuda", expected), enabled.conv_template_allow_tf32)
+        self.assertIn(("cuda", False), disabled.conv_template_allow_tf32)
 
     def test_non_cuda_flag_changes_fx_graph_cache_key(self):
         # cuda_matmul_settings already hashes CUDA fp32_precision. This swaps
