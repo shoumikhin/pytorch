@@ -241,7 +241,10 @@ class DeviceInterface:
         that Dynamo already compiled, and a subprocess compile would cache code
         built for the worker's value under the parent's FX graph cache key.
 
-        The default reads the cuDNN-wide fp32 precision.
+        The default reads the cuDNN-wide fp32 precision. The call site keeps
+        all convolutions in full precision under
+        torch._inductor.config.disable_conv_template_tf32, and on CUDA (not
+        ROCm) depthwise ones too, without calling it.
         """
         return torch.backends.cudnn.fp32_precision == "tf32"
 
@@ -457,6 +460,21 @@ class CudaInterface(DeviceInterface):
     @staticmethod
     def allow_tf32() -> bool:
         return torch.backends.cuda.matmul.fp32_precision == "tf32"
+
+    @staticmethod
+    def conv_allow_tf32() -> bool:
+        # ROCm follows the cuDNN-wide precision; its eager convolutions run on
+        # MIOpen, which reads neither precision. This returns before reading the
+        # cuDNN switch, which the guard records only on CUDA builds with cuDNN.
+        if torch.version.hip is not None:
+            return DeviceInterface.conv_allow_tf32()
+        # Without cuDNN, eager runs most convolutions as a matmul under the
+        # matmul precision; full precision is the conservative choice there.
+        if not (torch.backends.cudnn.enabled and torch.backends.cudnn.is_available()):
+            return False
+        # Eager cuDNN convolutions read the conv precision, which is TF32 by default
+        # while the cuDNN-wide setting stays "none".
+        return torch.backends.cudnn.conv.fp32_precision == "tf32"  # type: ignore[attr-defined]
 
     @staticmethod
     def raise_if_triton_unavailable(device: torch.types.Device = None) -> None:

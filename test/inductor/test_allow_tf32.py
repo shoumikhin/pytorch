@@ -1,6 +1,10 @@
 # Owner(s): ["module: inductor"]
 
+import os
+import subprocess
+import sys
 import unittest
+from unittest import mock
 
 import torch
 from torch._dynamo.device_interface import (
@@ -11,6 +15,7 @@ from torch._dynamo.device_interface import (
     register_interface_for_device,
     XpuInterface,
 )
+from torch._inductor import config
 from torch._inductor.codecache import compiled_fx_graph_hash, FxGraphHashDetails
 from torch._inductor.graph import GraphLowering
 from torch._inductor.heuristics.template.triton import MMTemplateConfigMixin
@@ -105,6 +110,47 @@ class TestAllowTf32Interface(TestCase):
         with torch.backends.flags(fp32_precision="none"):
             self.assertFalse(DeviceInterface.conv_allow_tf32())
 
+    @recover_orig_fp32_precision
+    def test_cuda_conv_allow_tf32_follows_conv_precision(self):
+        # Eager cuDNN convolutions use TF32 by default while the cuDNN-wide
+        # precision stays "none". ROCm keeps following the cuDNN-wide one, which
+        # inherits the generic one.
+        cuda = torch.version.hip is None
+        with mock.patch.object(torch.backends.cudnn, "is_available", return_value=True):
+            torch.backends.cudnn.conv.fp32_precision = "tf32"
+            with torch.backends.flags(fp32_precision="ieee"):
+                self.assertEqual(CudaInterface.conv_allow_tf32(), cuda)
+            torch.backends.cudnn.conv.fp32_precision = "ieee"
+            with torch.backends.flags(fp32_precision="tf32"):
+                self.assertEqual(CudaInterface.conv_allow_tf32(), not cuda)
+
+    @recover_orig_fp32_precision
+    def test_cuda_conv_allow_tf32_is_off_where_eager_skips_cudnn_tf32(self):
+        # Without cuDNN, eager would run most convolutions as a matmul, even
+        # under a "tf32" matmul precision. ROCm follows the cuDNN-wide
+        # precision, "none" here.
+        cuda = torch.version.hip is None
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        with mock.patch.object(torch.backends.cudnn, "is_available", return_value=True):
+            self.assertEqual(CudaInterface.conv_allow_tf32(), cuda)
+            with torch.backends.cudnn.flags(enabled=False):
+                self.assertFalse(CudaInterface.conv_allow_tf32())
+        with mock.patch.object(
+            torch.backends.cudnn, "is_available", return_value=False
+        ):
+            self.assertFalse(CudaInterface.conv_allow_tf32())
+
+    def test_nvidia_tf32_override_disables_conv_template_tf32(self):
+        # Inductor reads it once, when its config loads.
+        code = "import torch._inductor.config as c; print(c.disable_conv_template_tf32)"
+        # Only on CUDA builds.
+        nvidia = torch.version.cuda is not None
+        for value, expected in (("0", nvidia), ("1", False)):
+            env = {**os.environ, "NVIDIA_TF32_OVERRIDE": value}
+            out = subprocess.check_output([sys.executable, "-c", code], env=env)
+            self.assertEqual(out.decode().strip(), str(expected))
+
     def test_xpu_allow_tf32_matches_mkldnn(self):
         # Without USE_XPU the raw flag is None. The interface still returns a bool.
         self.assertEqual(
@@ -173,12 +219,32 @@ class TestAllowTf32ExtraKwargs(TestCase):
         extra = self.mixin.get_extra_kwargs(kernel_inputs, "mm")
         self.assertFalse(extra["ALLOW_TF32"])
 
+    @config.patch(disable_conv_template_tf32=False)
     def test_conv_template_allow_tf32_follows_device_interface(self):
         register_interface_for_device("privateuseone", _AllowTf32Interface)
         self.assertTrue(conv_template_allow_tf32("privateuseone"))
         # No device, or a device type with no DeviceInterface.
         self.assertFalse(conv_template_allow_tf32(None))
         self.assertFalse(conv_template_allow_tf32("meta"))
+
+    @recover_orig_fp32_precision
+    @config.patch(disable_conv_template_tf32=False)
+    def test_conv_template_keeps_cuda_depthwise_convs_in_full_precision(self):
+        # Other devices follow their interface for depthwise convolutions.
+        register_interface_for_device("privateuseone", _AllowTf32Interface)
+        self.assertTrue(conv_template_allow_tf32("privateuseone", depthwise=True))
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        rocm = torch.version.hip is not None
+        with (
+            torch.backends.flags(fp32_precision="tf32"),
+            mock.patch.object(torch.backends.cudnn, "is_available", return_value=True),
+            config.patch(disable_conv_template_tf32=False),
+        ):
+            self.assertTrue(conv_template_allow_tf32("cuda"))
+            self.assertEqual(conv_template_allow_tf32("cuda", depthwise=True), rocm)
+            with config.patch(disable_conv_template_tf32=True):
+                self.assertFalse(conv_template_allow_tf32("privateuseone"))
+                self.assertFalse(conv_template_allow_tf32("cuda"))
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     def test_cuda_small_shapes_disable_allow_tf32(self):
@@ -238,6 +304,18 @@ class TestAllowTf32ExtraKwargs(TestCase):
             torch.backends.cuda.matmul.fp32_precision = orig
         self.assertIn(("cuda", True), enabled.mm_template_allow_tf32)
         self.assertIn(("cuda", False), disabled.mm_template_allow_tf32)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
+    @recover_orig_fp32_precision
+    def test_cache_key_tracks_cuda_conv_allow_tf32(self):
+        tensor = torch.zeros(2, 2, device="cuda")
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        enabled = FxGraphHashDetails(None, [tensor], {}, [])
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        disabled = FxGraphHashDetails(None, [tensor], {}, [])
+        expected = torch.version.hip is None
+        self.assertIn(("cuda", expected), enabled.conv_template_allow_tf32)
+        self.assertIn(("cuda", False), disabled.conv_template_allow_tf32)
 
     def test_non_cuda_flag_changes_fx_graph_cache_key(self):
         # cuda_matmul_settings already hashes CUDA fp32_precision. This swaps

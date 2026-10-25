@@ -204,14 +204,27 @@ DEFAULT_EXPORT_DYNAMO_CONFIG.reorderable_logging_functions = {
 def _ignore_backend_decomps():
     orig_mkldnn_flag = torch.backends.mkldnn.set_flags(False)
     orig_nnpack_flag = torch.backends.nnpack.set_flags(False)
-    orig_cudnn_flag = torch.backends.cudnn.set_flags(False)
+    # Not cudnn.set_flags: it also reads the legacy TF32 getter, which raises
+    # unless the conv and RNN precisions and the legacy flag agree, and it
+    # rewrites the precisions on restore. The TF32 settings are left alone.
+    orig_cudnn_flags = (
+        torch._C._get_cudnn_enabled(),
+        torch._C._get_cudnn_benchmark(),
+        torch._C._get_cudnn_deterministic(),
+        torch._C._get_cudnn_depthwise_kernel(),
+    )
+    torch._C._set_cudnn_enabled(False)
 
     try:
         yield
     finally:
         torch.backends.mkldnn.set_flags(*orig_mkldnn_flag)
         torch.backends.nnpack.set_flags(*orig_nnpack_flag)
-        torch.backends.cudnn.set_flags(*orig_cudnn_flag)
+        enabled, benchmark, deterministic, depthwise_kernel = orig_cudnn_flags
+        torch._C._set_cudnn_enabled(enabled)
+        torch._C._set_cudnn_benchmark(benchmark)
+        torch._C._set_cudnn_deterministic(deterministic)
+        torch._C._set_cudnn_depthwise_kernel(depthwise_kernel)
 
 
 @contextmanager

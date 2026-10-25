@@ -45,13 +45,23 @@ log = logging.getLogger(__name__)
 aten = torch.ops.aten
 
 
-def conv_template_allow_tf32(device_type: str | None, /) -> bool:
-    """Whether a Triton conv template should use TF32, per the device interface."""
-    if device_type is None:
+def conv_template_allow_tf32(
+    device_type: str | None, /, *, depthwise: bool = False
+) -> bool:
+    """Whether a Triton conv template should use TF32, per the device interface.
+
+    config.disable_conv_template_tf32 keeps all of them in full precision, and
+    on NVIDIA GPUs (not ROCm) depthwise convolutions stay in full precision too.
+    """
+    if device_type is None or config.disable_conv_template_tf32:
         return False
     try:
         iface = get_interface_for_device(device_type)
     except NotImplementedError:
+        return False
+    if depthwise and device_type == "cuda" and torch.version.hip is None:
+        # Eager runs contiguous fp32 depthwise convolutions on native kernels
+        # without TF32; the conservative choice keeps all of them that way.
         return False
     return bool(iface.conv_allow_tf32())
 
@@ -469,8 +479,16 @@ def convolution(
     transposed: bool,
     output_padding: Sequence[int],
     groups: int,
+    *,
+    allow_tf32: bool = True,
 ):
-    """Lower aten.convolution using Inductor convolution kernels or fallbacks."""
+    """Lower aten.convolution using Inductor convolution kernels or fallbacks.
+
+    allow_tf32=False keeps the Triton conv templates in full precision, for an
+    aten._convolution that disables TF32 or cuDNN. The ATen choices, the
+    1x1-as-matmul path and the ROCm CK choices ignore it and follow the global
+    settings.
+    """
     stride = tuple(stride)
     padding = tuple(padding)
     dilation = tuple(dilation)
@@ -506,7 +524,13 @@ def convolution(
     if len(x.get_size()) == len(weight.get_size()) - 1:
         # add batch dimension to simplify rest of function
         return L[aten.squeeze](
-            convolution(L[aten.expand](x, [1, *x.get_size()]), weight, bias, **kwargs),
+            convolution(
+                L[aten.expand](x, [1, *x.get_size()]),
+                weight,
+                bias,
+                **kwargs,
+                allow_tf32=allow_tf32,
+            ),
             dim=0,
         )
 
@@ -529,7 +553,7 @@ def convolution(
         weight = L[aten.unsqueeze](weight, dim=2)
 
         return L[aten.squeeze](
-            convolution(x, weight, bias, **kwargs),
+            convolution(x, weight, bias, **kwargs, allow_tf32=allow_tf32),
             dim=2,
         )
 
@@ -568,7 +592,7 @@ def convolution(
 
     if bias is not None and device_type != "cpu":
         # peel off the bias, cudnn is slower with it
-        result = convolution(x, weight, None, **kwargs)
+        result = convolution(x, weight, None, **kwargs, allow_tf32=allow_tf32)
         if V.graph.sizevars.statically_known_equals(result.get_size()[1], 0):
             # we should not add bias when the output channel is 0
             return result
@@ -619,7 +643,11 @@ def convolution(
         bias.freeze_layout()
         V.graph.sizevars.guard_int_seq(bias.get_size())
 
-    template_allow_tf32 = conv_template_allow_tf32(device_type)
+    # Depthwise as eager defines it.
+    depthwise = groups > 1 and in_chan == 1 and not transposed
+    template_allow_tf32 = allow_tf32 and conv_template_allow_tf32(
+        device_type, depthwise=depthwise
+    )
     choices = []
     if torch._inductor.utils._use_conv_autotune_backend("ATEN"):
         choices = [
@@ -649,8 +677,8 @@ def convolution(
         ):
             choices.append(aten_conv1x1_via_mm.bind(args, layout))
 
-        is_depthwise = groups > 1 and in_chan == 1 and out_chan == groups
-        if is_depthwise and ndim == 1:
+        # The 1D depthwise template needs one output channel per group.
+        if depthwise and out_chan == groups and ndim == 1:
             depthwise_configs = V.choices.get_depthwise_conv_configs(device_type)
             for cfg in depthwise_configs:
                 depthwise_conv1d_template.maybe_append_choice(
@@ -808,7 +836,18 @@ def _convolution(
     allow_tf32,
 ):
     return convolution(
-        x, weight, bias, stride, padding, dilation, transposed, output_padding, groups
+        x,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+        # Eager passes allow_tf32 only to cuDNN. Without cuDNN the templates
+        # stay in full precision, the conservative choice.
+        allow_tf32=allow_tf32 and cudnn_enabled,
     )
 
 
@@ -1116,7 +1155,10 @@ def convolution_backward_lowering(
     dtype_size = input.get_dtype().itemsize
     # The op-less torch.backends.cudnn.allow_tf32 raises unless the conv and
     # RNN precisions agree with the legacy flag.
-    allow_tf32 = torch.backends.cudnn.conv.fp32_precision == "tf32"  # type: ignore[attr-defined]
+    allow_tf32 = (
+        torch.backends.cudnn.conv.fp32_precision == "tf32"  # type: ignore[attr-defined]
+        and not config.disable_conv_template_tf32
+    )
 
     has_triton_dw_choices = False
     dw = None

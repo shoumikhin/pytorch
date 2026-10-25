@@ -773,6 +773,13 @@ max_autotune_conv_bwd_input_backends = os.environ.get(
     "TORCHINDUCTOR_MAX_AUTOTUNE_BWD_INPUT_CONV_BACKENDS", _conv_default_backends
 ).upper()
 
+# Keeps the Triton conv templates in full precision. On by default on CUDA
+# builds under NVIDIA_TF32_OVERRIDE=0, which turns TF32 off in cuDNN and cuBLAS
+# but which Triton kernels do not read.
+disable_conv_template_tf32: bool = (
+    os.environ.get("NVIDIA_TF32_OVERRIDE") == "0" and torch.version.cuda is not None
+)
+
 # Specify the size of the search space for GEMM autotuning.
 # DEFAULT     - balance between compile time overhead and performance
 # EXHAUSTIVE  - maximize performance

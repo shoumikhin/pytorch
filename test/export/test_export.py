@@ -90,6 +90,7 @@ from torch.testing._internal.common_utils import (
     IS_MACOS,
     IS_SANDCASTLE,
     IS_WINDOWS,
+    recover_orig_fp32_precision,
     run_tests,
     skipIfCrossRef,
     skipIfRocm,
@@ -12416,6 +12417,16 @@ graph():
         expected_0 = model(x, y, 0)
         ep_0 = torch.export.export(model, (x, y, 0))
         self.assertTrue(torch.equal(ep_0.module()(x, y, 0), expected_0))
+
+    @recover_orig_fp32_precision
+    def test_export_under_an_ieee_conv_precision(self):
+        # Export used cudnn.set_flags, which raises unless the conv and RNN fp32
+        # precisions agree with the legacy allow_tf32 flag.
+        enabled = torch.backends.cudnn.enabled
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        export(torch.nn.Conv2d(3, 4, 3), (torch.randn(1, 3, 8, 8),))
+        self.assertEqual(torch.backends.cudnn.conv.fp32_precision, "ieee")
+        self.assertEqual(torch.backends.cudnn.enabled, enabled)
 
     def test_export_then_compile_tensor_ctor(self):
         class M(torch.nn.Module):
