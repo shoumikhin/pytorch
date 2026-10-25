@@ -1812,6 +1812,27 @@ print(mem_after_first, mem_after_set, torch.cuda.memory_allocated())
             self.assertEqual(torch.backends.cudnn.rnn.fp32_precision, "none")
 
     @recover_orig_fp32_precision
+    def test_flags_with_differing_conv_and_rnn_precisions(self):
+        # The legacy allow_tf32 getter raises for this state, which flags()
+        # used to read on entry.
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        torch.backends.cudnn.rnn.fp32_precision = "tf32"
+        with torch.backends.cudnn.flags(enabled=None, allow_tf32=True):
+            self.assertEqual(torch.backends.cudnn.conv.fp32_precision, "tf32")
+        self.assertEqual(torch.backends.cudnn.conv.fp32_precision, "ieee")
+        self.assertEqual(torch.backends.cudnn.rnn.fp32_precision, "tf32")
+
+    @recover_orig_fp32_precision
+    def test_flags_still_raise_for_a_legacy_flag_mismatch(self):
+        # Conv and RNN agree but not with the legacy flag, which the legacy
+        # getter rejects; saving them would pin them to inherited values.
+        with torch.backends.flags(fp32_precision="ieee"):
+            with self.assertRaisesRegex(RuntimeError, "allow_tf32"):
+                with torch.backends.cudnn.flags(enabled=None):
+                    pass
+        self.assertEqual(torch.backends.cudnn.conv.fp32_precision, "tf32")
+
+    @recover_orig_fp32_precision
     @serialTest()
     def test_fp32_precision_with_float32_matmul_precision(self):
         torch.set_float32_matmul_precision("highest")

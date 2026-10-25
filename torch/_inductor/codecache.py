@@ -1731,13 +1731,10 @@ class FxGraphHashDetails:
         self.mm_template_allow_tf32 = self._template_allow_tf32(
             device_types, lambda iface: iface.allow_tf32()
         )
-        # The conv lowering's template ALLOW_TF32 follows
-        # DeviceInterface.conv_allow_tf32.
+        # The conv templates' ALLOW_TF32 follows DeviceInterface.conv_allow_tf32.
         self.conv_template_allow_tf32 = self._template_allow_tf32(
             device_types, lambda iface: iface.conv_allow_tf32()
         )
-        # The convolution_backward lowering's templates read the conv precision.
-        self.cudnn_conv_precision = torch._C._get_fp32_precision_getter("cuda", "conv")
 
         # compile-on-one-rank changes wrapper and kernel codegen (runtime device
         # resolution, DeviceProperties(index=None)) even for graphs that contain no

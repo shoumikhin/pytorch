@@ -228,9 +228,8 @@ class DeviceInterface:
 
     @staticmethod
     def conv_allow_tf32() -> bool:
-        """Whether the convolution lowering's Triton templates may set
-        ALLOW_TF32 on this backend. The convolution_backward lowering's
-        templates do not use it; they read the CUDA conv fp32 precision.
+        """Whether the Triton conv templates, forward and backward, may set
+        ALLOW_TF32 on this backend.
 
         An override must read only build properties and settings that both
         Dynamo's global state guard (GlobalStateGuard) checks and the
@@ -241,7 +240,12 @@ class DeviceInterface:
         that Dynamo already compiled, and a subprocess compile would cache code
         built for the worker's value under the parent's FX graph cache key.
 
-        The default reads the cuDNN-wide fp32 precision.
+        The default reads the cuDNN-wide fp32 precision. The call site,
+        torch._inductor.kernel.conv.conv_template_allow_tf32, keeps
+        convolutions in full precision without calling it under
+        torch._inductor.config.disable_conv_template_tf32, and on CUDA (not
+        ROCm) for depthwise ones and for an aten._convolution with
+        cudnn_enabled=False.
         """
         return torch.backends.cudnn.fp32_precision == "tf32"
 
@@ -457,6 +461,21 @@ class CudaInterface(DeviceInterface):
     @staticmethod
     def allow_tf32() -> bool:
         return torch.backends.cuda.matmul.fp32_precision == "tf32"
+
+    @staticmethod
+    def conv_allow_tf32() -> bool:
+        # ROCm follows the cuDNN-wide precision; its eager convolutions run on
+        # MIOpen, which reads neither precision. This returns before reading the
+        # cuDNN switch, which the guard compares only on CUDA builds with cuDNN.
+        if torch.version.hip is not None:
+            return DeviceInterface.conv_allow_tf32()
+        # Without cuDNN, eager runs most convolutions as a matmul under the
+        # matmul precision; full precision is the conservative choice there.
+        if not (torch.backends.cudnn.enabled and torch.backends.cudnn.is_available()):
+            return False
+        # Eager cuDNN convolutions read the conv precision, which is TF32 by default
+        # while the cuDNN-wide setting stays "none".
+        return torch.backends.cudnn.conv.fp32_precision == "tf32"  # type: ignore[attr-defined]
 
     @staticmethod
     def raise_if_triton_unavailable(device: torch.types.Device = None) -> None:

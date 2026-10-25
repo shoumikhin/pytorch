@@ -213,6 +213,23 @@ For more information about TF32, see:
 - [Ampere architecture](https://devblogs.nvidia.com/nvidia-ampere-architecture-in-depth/)
 
 
+### TF32 in `torch.compile` convolution templates
+
+Under `torch.compile` with `max_autotune` or `max_autotune_gemm`, Inductor's Triton convolution templates on NVIDIA
+GPUs follow `torch.backends.cudnn.conv.fp32_precision`, like eager cuDNN convolutions. They stay in full precision for
+depthwise convolutions and when cuDNN is disabled. On ROCm they follow `torch.backends.cudnn.fp32_precision`. 1x1
+convolutions that Inductor turns into matmuls follow the matmul precision instead.
+
+To keep the templates in full precision without changing eager convolutions, set
+`torch._inductor.config.disable_conv_template_tf32 = True`; on CUDA builds `NVIDIA_TF32_OVERRIDE=0` turns it on. On
+NVIDIA GPUs, `torch.backends.cudnn.conv.fp32_precision = "ieee"` keeps both eager convolutions and these templates in
+full precision. Changing the conv precision, the cuDNN-wide or generic precision it inherits, or, on CUDA builds with
+cuDNN, enabling or disabling cuDNN (as `torch.backends.cudnn.flags()` does by default) between calls recompiles
+compiled functions, and a function compiled with `.aot_compile()` raises a `RuntimeError` instead. Inside a compiled
+function, assigning `torch.backends.cudnn.enabled`, `allow_tf32` or `fp32_precision` takes effect after the graph runs,
+so the templates in that graph keep the settings from the start of the call, while assigning
+`torch.backends.cudnn.conv.fp32_precision` causes a graph break and applies to the code after it.
+
 (fp16reducedprecision)=
 
 ## Reduced Precision Reduction in FP16 GEMMs

@@ -151,13 +151,37 @@ def is_acceptable(tensor):
     return True
 
 
+def _get_allow_tf32():
+    try:
+        return torch._C._get_cudnn_allow_tf32()
+    except RuntimeError:
+        conv = torch._C._get_fp32_precision_getter("cuda", "conv")
+        rnn = torch._C._get_fp32_precision_getter("cuda", "rnn")
+        # Only conv and RNN precisions that differ need the pair, since the
+        # legacy flag cannot hold them; other mismatches still raise.
+        if conv == rnn:
+            raise
+        return (conv, rnn)
+
+
+def _set_allow_tf32(allow_tf32):
+    if isinstance(allow_tf32, tuple):
+        # The legacy flag, unreadable in this state, keeps the value set_flags
+        # gave it.
+        conv, rnn = allow_tf32
+        torch._C._set_fp32_precision_setter("cuda", "conv", conv)
+        torch._C._set_fp32_precision_setter("cuda", "rnn", rnn)
+    else:
+        torch._C._set_cudnn_allow_tf32(allow_tf32)
+
+
 def set_flags(
     _enabled=None,
     _benchmark=None,
     _benchmark_limit=None,
     _deterministic=None,
     _allow_tf32=None,
-    _fp32_precision="none",
+    _fp32_precision=None,
     _depthwise_kernel=None,
 ):
     orig_flags = (
@@ -165,8 +189,12 @@ def set_flags(
         torch._C._get_cudnn_benchmark(),
         None if not is_available() else torch._C._cuda_get_cudnn_benchmark_limit(),
         torch._C._get_cudnn_deterministic(),
-        torch._C._get_cudnn_allow_tf32(),
-        torch._C._get_fp32_precision_getter("cuda", "all"),
+        # Saving only the precisions this call changes keeps the restore from
+        # pinning the others to the values they inherit.
+        None if _allow_tf32 is None else _get_allow_tf32(),
+        None
+        if _fp32_precision is None
+        else torch._C._get_fp32_precision_getter("cuda", "all"),
         torch._C._get_cudnn_depthwise_kernel(),
     )
     if _enabled is not None:
@@ -178,7 +206,7 @@ def set_flags(
     if _deterministic is not None:
         torch._C._set_cudnn_deterministic(_deterministic)
     if _allow_tf32 is not None:
-        torch._C._set_cudnn_allow_tf32(_allow_tf32)
+        _set_allow_tf32(_allow_tf32)
     if _fp32_precision is not None:
         torch._C._set_fp32_precision_setter("cuda", "all", _fp32_precision)
     if _depthwise_kernel is not None:

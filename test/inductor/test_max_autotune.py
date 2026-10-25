@@ -4006,6 +4006,7 @@ class TestMaxAutotune(TestCase):
         self.assertNotIn("acc.to(tl.bfloat16)", code[0])
 
 
+@config.patch(disable_conv_template_tf32=False)
 @instantiate_parametrized_tests
 class TestConvTemplateTF32(TestCase):
     """ALLOW_TF32 of the Triton conv templates, in-process and in subprocess compiles."""
@@ -4013,17 +4014,19 @@ class TestConvTemplateTF32(TestCase):
     @unittest.skipUnless(
         HAS_GPU and TEST_WITH_ROCM, "Triton backward conv templates run on ROCm"
     )
-    @parametrize("conv_precision", ("ieee", "tf32"))
+    @parametrize("cudnn_precision", ("ieee", "tf32"))
+    @parametrize("disable", (False, True))
     @config.patch(
         max_autotune=True,
         max_autotune_conv_bwd_weight_backends="TRITON",
         max_autotune_conv_bwd_input_backends="TRITON",
     )
     @recover_orig_fp32_precision
-    def test_conv_backward_templates_follow_the_conv_precision(self, conv_precision):
-        # An "ieee" conv precision set alone made the legacy
-        # torch.backends.cudnn.allow_tf32 getter, which the lowering read, raise.
-        torch.backends.cudnn.conv.fp32_precision = conv_precision
+    def test_conv_backward_templates_follow_the_forward_rule(
+        self, cudnn_precision, disable
+    ):
+        # On ROCm, like the forward templates, they follow the cuDNN-wide
+        # precision; cudnn.flags() also sets the conv one to "tf32".
 
         def conv_backward(grad_output, x, w):
             return torch.ops.aten.convolution_backward.default(
@@ -4043,10 +4046,159 @@ class TestConvTemplateTF32(TestCase):
         x = torch.randn(2, 32, 16, 16, device=GPU_TYPE)
         w = torch.randn(32, 32, 3, 3, device=GPU_TYPE)
         grad_output = torch.randn(2, 32, 16, 16, device=GPU_TYPE)
-        _, code = run_and_get_code(torch.compile(conv_backward), grad_output, x, w)
-        expect_tf32 = conv_precision == "tf32" and torch.cuda.is_tf32_supported()
+        with (
+            torch.backends.cudnn.flags(enabled=True, fp32_precision=cudnn_precision),
+            config.patch(disable_conv_template_tf32=disable),
+        ):
+            _, code = run_and_get_code(torch.compile(conv_backward), grad_output, x, w)
+        expect_tf32 = (
+            cudnn_precision == "tf32" and not disable and torch.cuda.is_tf32_supported()
+        )
         self.assertIn(f"ALLOW_TF32 : tl.constexpr = {expect_tf32}", code[0])
         self.assertNotIn(f"ALLOW_TF32 : tl.constexpr = {not expect_tf32}", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @parametrize(
+        "kind",
+        (
+            "regular",
+            "regular_3d",
+            "single_channel",
+            "grouped",
+        ),
+    )
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    def test_conv_template_follows_the_default_conv_precision(self, kind):
+        # Eager cuDNN convolutions use TF32 by default while the cuDNN-wide
+        # precision stays "none". ROCm follows the cuDNN-wide precision, and
+        # Triton templates never use TF32 on a GPU that has none.
+        ndim = 3 if kind == "regular_3d" else 2
+        in_channels = 1 if kind == "single_channel" else 32
+        # grouped has 8 input channels per group.
+        groups = 4 if kind == "grouped" else 1
+        actual, expected, code = self._compile_small_integer_conv(
+            ndim, in_channels, 32, groups
+        )
+        self.assertEqual(actual, expected)
+        expect_tf32 = torch.version.hip is None and torch.cuda.is_tf32_supported()
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {expect_tf32}", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @parametrize("kind", ("depthwise", "depthwise_x2", "depthwise_3d"))
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    def test_conv_template_keeps_depthwise_convs_in_full_precision(self, kind):
+        # Even under a "tf32" generic precision, which the conv and cuDNN-wide
+        # precisions inherit. ROCm follows the cuDNN-wide precision.
+        ndim = 3 if kind == "depthwise_3d" else 2
+        # depthwise_x2 has two output channels per input channel.
+        out_channels = 64 if kind == "depthwise_x2" else 32
+        with torch.backends.flags(fp32_precision="tf32"):
+            actual, expected, code = self._compile_small_integer_conv(
+                ndim, 32, out_channels, 32
+            )
+        self.assertEqual(actual, expected)
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {self._rocm_tf32()}", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @parametrize("ndim", (2, 3))
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    @recover_orig_fp32_precision
+    def test_conv_template_follows_an_ieee_conv_precision(self, ndim):
+        # Even under a "tf32" generic precision, which the cuDNN-wide one, and
+        # so the ROCm templates, follow.
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        with torch.backends.flags(fp32_precision="tf32"):
+            actual, expected, code = self._compile_small_integer_conv(ndim, 32, 32, 1)
+        self.assertEqual(actual, expected)
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {self._rocm_tf32()}", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    @recover_orig_fp32_precision
+    def test_conv_template_stays_in_full_precision_without_cudnn(self):
+        # Eager then runs the convolution as a matmul. Here every precision
+        # allows TF32: the matmul one, and the generic one that the conv and
+        # cuDNN-wide ones inherit. ROCm follows the cuDNN-wide precision.
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        # cudnn.flags() goes outside, so it restores what it saved before the
+        # generic precision changes.
+        with (
+            torch.backends.cudnn.flags(enabled=False),
+            torch.backends.flags(fp32_precision="tf32"),
+        ):
+            actual, expected, code = self._compile_small_integer_conv(2, 32, 32, 1)
+        self.assertEqual(actual, expected)
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {self._rocm_tf32()}", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @parametrize(
+        "cudnn_enabled,allow_tf32,with_bias",
+        ((True, True, True), (False, True, False), (True, False, True)),
+    )
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    def test_conv_template_follows_the_convolution_flags(
+        self, cudnn_enabled, allow_tf32, with_bias
+    ):
+        # Both the conv and the cuDNN-wide precision allow TF32 here, so the
+        # aten._convolution flags decide. ROCm ignores cudnn_enabled.
+        aten_flags = (cudnn_enabled, allow_tf32)
+        with torch.backends.cudnn.flags(
+            enabled=True, allow_tf32=True, fp32_precision="tf32"
+        ):
+            actual, expected, code = self._compile_small_integer_conv(
+                2, 32, 32, 1, with_bias=with_bias, aten_flags=aten_flags
+            )
+        self.assertEqual(actual, expected)
+        expect_tf32 = (
+            (cudnn_enabled or torch.version.hip is not None)
+            and allow_tf32
+            and torch.cuda.is_tf32_supported()
+        )
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {expect_tf32}", code[0])
+        self.assertNotIn(f"ALLOW_TF32 : tl.constexpr = {not expect_tf32}", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    def test_conv_template_recompiles_when_the_conv_precision_changes(self):
+        # Dynamo recompiles and the FX graph cache key changes, so the second
+        # compile generates the template under the new precision. ROCm
+        # templates follow the cuDNN-wide precision instead.
+        x = torch.randn(2, 32, 16, 16, device=GPU_TYPE)
+        w = torch.randn(32, 32, 3, 3, device=GPU_TYPE)
+        compiled = torch.compile(torch.nn.functional.conv2d)
+        codes: list[str] = []
+        with mock.patch.object(GraphLowering, "save_output_code", codes.append):
+            for allow_tf32 in (True, False):
+                with torch.backends.cudnn.flags(enabled=True, allow_tf32=allow_tf32):
+                    compiled(x, w)
+        self.assertEqual(len(codes), 2)
+        expect_tf32 = torch.version.hip is None and torch.cuda.is_tf32_supported()
+        self.assertIn(f"ALLOW_TF32 : tl.constexpr = {expect_tf32}", codes[0])
+        self.assertIn("ALLOW_TF32 : tl.constexpr = False", codes[1])
 
     @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
     @config.patch(max_autotune=True, max_autotune_gemm_backends="TRITON")
@@ -4075,6 +4227,86 @@ class TestConvTemplateTF32(TestCase):
                 FxCompile._compile_stats[_SubprocessFxCompile].codegen_and_compile, 1
             )
             self.assertIn(f"ALLOW_TF32 : tl.constexpr = {matmul == 'none'}", code[0])
+
+    @unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    @config.patch(
+        max_autotune=True,
+        max_autotune_conv_backends="TRITON",
+        layout_optimization=False,
+    )
+    def test_subprocess_compile_uses_the_parent_conv_precision(self):
+        if torch.version.hip is not None or not torch.cuda.is_tf32_supported():
+            raise unittest.SkipTest("requires a CUDA GPU with TF32")
+        torch._dynamo.reset()
+        FxCompile._reset_stats()
+        x = torch.randn(2, 32, 32, 32, device=GPU_TYPE)
+        w = torch.randn(32, 32, 3, 3, device=GPU_TYPE)
+        # The worker's own conv precision is TF32.
+        with (
+            mock.patch(
+                "torch._inductor.compile_fx.fx_compile_mode", FxCompileMode.SUBPROCESS
+            ),
+            torch.backends.cudnn.flags(enabled=True, allow_tf32=False),
+        ):
+            _, code = run_and_get_code(torch.compile(torch.nn.functional.conv2d), x, w)
+        self.assertEqual(
+            FxCompile._compile_stats[_SubprocessFxCompile].codegen_and_compile, 1
+        )
+        self.assertIn("ALLOW_TF32 : tl.constexpr = False", code[0])
+        self.assertNotIn("ALLOW_TF32 : tl.constexpr = True", code[0])
+
+    @staticmethod
+    def _rocm_tf32():
+        # What a template under a "tf32" cuDNN-wide precision gets on ROCm; CUDA
+        # cases using it expect full precision.
+        return torch.version.hip is not None and torch.cuda.is_tf32_supported()
+
+    def _compile_small_integer_conv(
+        self,
+        ndim,
+        in_channels,
+        out_channels,
+        groups,
+        /,
+        *,
+        with_bias=False,
+        aten_flags=None,
+    ):
+        # Small integers are exact in TF32, so both precisions match eager.
+        # aten_flags, a (cudnn_enabled, allow_tf32) pair, calls aten._convolution
+        # instead of the functional conv.
+        spatial = (16, 16) if ndim == 2 else (8, 8, 8)
+        x = torch.randint(-2, 3, (2, in_channels, *spatial), device=GPU_TYPE).float()
+        shape = (out_channels, in_channels // groups, *(3,) * ndim)
+        w = torch.randint(-2, 3, shape, device=GPU_TYPE).float()
+        b = torch.randint(-2, 3, (out_channels,), device=GPU_TYPE).float()
+        b = b if with_bias else None
+        functional_conv = (
+            torch.nn.functional.conv2d if ndim == 2 else torch.nn.functional.conv3d
+        )
+
+        def conv(x, w, b):
+            if aten_flags is None:
+                return functional_conv(x, w, b, groups=groups)
+            cudnn_enabled, allow_tf32 = aten_flags
+            return torch._convolution(
+                x,
+                w,
+                b,
+                stride=[1] * ndim,
+                padding=[0] * ndim,
+                dilation=[1] * ndim,
+                transposed=False,
+                output_padding=[0] * ndim,
+                groups=groups,
+                benchmark=False,
+                deterministic=False,
+                cudnn_enabled=cudnn_enabled,
+                allow_tf32=allow_tf32,
+            )
+
+        actual, code = run_and_get_code(torch.compile(conv), x, w, b)
+        return actual, conv(x, w, b), code
 
 
 @instantiate_parametrized_tests
